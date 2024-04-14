@@ -776,6 +776,9 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+                print("noisy_latents", noisy_latents.shape)
+                print("encoder_hidden_states", encoder_hidden_states.shape)
+
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 

@@ -41,6 +41,7 @@ from peft.utils import get_peft_model_state_dict
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
+from label_model import *
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel
@@ -50,6 +51,7 @@ from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, 
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from PIL import Image
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -290,6 +292,14 @@ def parse_args():
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
+    parser.add_argument(
+        "--num_iters_per_epoch",
+        type=int,
+        default=1,
+        help=(
+            "Number of iterations per epoch"
+        ),
+    )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
@@ -374,14 +384,17 @@ def parse_args():
         help=("The dimension of the LoRA update matrices."),
     )
 
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=7.5,
+        help=("The scale of the guidance for text over original.")
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
 
     return args
 
@@ -435,6 +448,10 @@ def main():
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
+    image_output_path = args.output_dir + "/images/"
+    if not os.path.exists(image_output_path):
+        os.mkdir(image_output_path)
+
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
@@ -462,6 +479,7 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
+    labelnet = LabelNet()
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
@@ -490,6 +508,7 @@ def main():
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    labelnet.to(accelerator.device, dtype=weight_dtype)
 
     # Add adapter and make sure the trainable params are in float32.
     unet.add_adapter(unet_lora_config)
@@ -551,63 +570,10 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
+    def tokenize_captions(captions, is_train=True):
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -630,16 +596,10 @@ def main():
         return model
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
+        images = [image.convert("RGB") for image in examples["images"]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
+        examples["input_ids"] = tokenize_captions(examples['captions'])
         return examples
-
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -647,18 +607,9 @@ def main():
         input_ids = torch.stack([example["input_ids"] for example in examples])
         return {"pixel_values": pixel_values, "input_ids": input_ids}
 
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
-
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(args.num_train_epochs / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -671,12 +622,12 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    unet, optimizer, lr_scheduler = accelerator.prepare(
+        unet, optimizer, lr_scheduler
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(args.num_iters_per_epoch / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -691,7 +642,7 @@ def main():
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num iters per epoch = {args.num_iters_per_epoch}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -735,72 +686,110 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    def make_grad_hook(coef):
+        return lambda x: coef * x
+
+    def optimal_transport_loss(pred_labels):
+        target = torch.zeros(pred_labels.shape, dtype=torch.float32, device=accelerator.device)
+        loss = F.mse_loss(pred_labels.float(), target.float())
+        return loss.mean()
+
+    # torch.cuda.empty_cache()
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
+
         train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
+        for step in range(0, args.num_iters_per_epoch):
             with accelerator.accumulate(unet):
-                # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                ### Generate Images Start #####
+                images = []
+                for image_i in range(0, 1):
+                    noises = torch.randn((1, 4, 64, 64)).to(torch.bfloat16).to(accelerator.device)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                    prompt = "One Single Melanoma on skin tissue"
+                    num_denoising_steps = 8
+
+                    N = noises.shape[0]
+                    prompts = [prompt] * N
+
+                    prompts_token = tokenizer(prompts, return_tensors="pt", padding=True)
+                    prompts_token["input_ids"] = prompts_token["input_ids"].to(accelerator.device)
+                    prompts_token["attention_mask"] = prompts_token["attention_mask"].to(accelerator.device)
+
+                    prompt_embeds = text_encoder(
+                        prompts_token["input_ids"],
+                        prompts_token["attention_mask"],
                     )
+                    prompt_embeds = prompt_embeds[0]
 
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                    batch_size = prompt_embeds.shape[0]
+                    uncond_tokens = [""] * batch_size
+                    max_length = prompt_embeds.shape[1]
+                    uncond_input = tokenizer(
+                        uncond_tokens,
+                        padding="max_length",
+                        max_length=max_length,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    uncond_input["input_ids"] = uncond_input["input_ids"].to(accelerator.device)
+                    uncond_input["attention_mask"] = uncond_input["attention_mask"].to(accelerator.device)
+                    negative_prompt_embeds = text_encoder(
+                        uncond_input["input_ids"],
+                        uncond_input["attention_mask"],
+                    )
+                    negative_prompt_embeds = negative_prompt_embeds[0]
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds]).to(weight_dtype)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                    noise_scheduler.set_timesteps(num_denoising_steps)
+                    grad_coefs = []
+                    for i, t in enumerate(noise_scheduler.timesteps):
+                        grad_coefs.append(noise_scheduler.alphas_cumprod[t].sqrt().item() * (
+                                1 - noise_scheduler.alphas_cumprod[t]).sqrt().item() / (
+                                                      1 - noise_scheduler.alphas[t].item()))
+                    grad_coefs = np.array(grad_coefs)
+                    grad_coefs /= (math.prod(grad_coefs) ** (1 / len(grad_coefs)))
 
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                    latents = noises
+                    for i, t in enumerate(noise_scheduler.timesteps):
+                        # scale model input
+                        latent_model_input = torch.cat([latents.detach().to(weight_dtype)] * 2)
+                        latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
 
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                        noises_pred = unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                        ).sample
+                        noises_pred = noises_pred.to(torch.float32)
 
-                # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                        noises_pred_uncond, noises_pred_text = noises_pred.chunk(2)
+                        noises_pred = noises_pred_uncond + args.guidance_scale * (
+                                    noises_pred_text - noises_pred_uncond)
 
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        mse_loss_weights = mse_loss_weights / snr
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        mse_loss_weights = mse_loss_weights / (snr + 1)
+                        hook_fn = make_grad_hook(grad_coefs[i])
+                        noises_pred.register_hook(hook_fn)
 
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                        latents = noise_scheduler.step(noises_pred, t, latents).prev_sample
+                    latents = 1 / vae.config.scaling_factor * latents
+                    image = vae.decode(latents.to(vae.dtype)).sample.clamp(-1, 1)  # in range [-1,1]
+                    images.append(image)
+
+                    # img = Image.fromarray(
+                    #     ((image[0].permute([1, 2, 0]).cpu().detach().numpy() + 1.0) / 2.0 * 255).astype(np.uint8))
+                    # img.save(image_output_path + str(image_i) + ".jpg", "JPEG")
+
+                ### Generate Images End #####
+                pred_labels = torch.zeros((len(images), 1), dtype=torch.float32, device=accelerator.device)
+                for i in range(0, len(images)):
+                    pred_labels[i]= labelnet(image)
+                print(pred_labels)
+                loss = optimal_transport_loss(pred_labels)
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                # avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                # train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -908,10 +897,10 @@ def main():
                                 ]
                             }
                         )
-
+                images[0].save(image_output_path + str(epoch) + "_epoch.jpg", "JPEG")
                 del pipeline
                 torch.cuda.empty_cache()
-
+    # #
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -924,21 +913,6 @@ def main():
             unet_lora_layers=unet_lora_state_dict,
             safe_serialization=True,
         )
-
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                images=images,
-                base_model=args.pretrained_model_name_or_path,
-                dataset_name=args.dataset_name,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
 
         # Final inference
         # Load previous pipeline

@@ -1079,7 +1079,6 @@ def main(args):
                 add_time_ids = torch.cat(
                     [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])]
                 )
-                print("add_time_ids", add_time_ids.shape, add_time_ids)
 
                 # Predict the noise residual
                 unet_added_conditions = {"time_ids": add_time_ids}
