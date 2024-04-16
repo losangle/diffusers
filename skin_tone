@@ -1,0 +1,41 @@
+# CALCULATING ITA 
+
+from derm_ita import get_ita
+from PIL import Image
+from derm_ita import get_kinyanjui_type
+
+    
+# Folder containing images
+folder_path = 'train'
+
+# Initialize a list to store ITA values
+ita_dict = {'image_name': [], 'ITA': [], 'skin_tone': []}
+
+# Loop through all images in the folder
+for filename in os.listdir(folder_path):
+    if filename.endswith('.jpg') or filename.endswith('.jpeg'):
+        # Load the image
+        image_path = os.path.join(folder_path, filename)
+        #image = cv2.imread(image_path)
+        
+        # Calculate ITA
+        ita = get_ita(image=Image.open(image_path))
+        
+
+        kinyanjui_type = get_kinyanjui_type(ita)
+        # Store image name and ITA value
+        ita_dict['image_name'].append(filename.split('.jpg')[0])
+        ita_dict['ITA'].append(ita)
+        ita_dict['skin_tone'].append(kinyanjui_type)
+
+# Create a DataFrame from the dictionary
+df_ITA = pd.DataFrame(ita_dict)
+
+print(df_ITA)
+df_ITA.to_csv('skin_tone.csv', index=False)
+
+# Append ITA values to existing DataFrame
+#existing_df = pd.merge(df, df_ITA, on='image_name', how='left').fillna(0)
+
+# Save the DataFrame to a CSV file
+#existing_df.to_csv('train_ITA_lib.csv', index=False)
