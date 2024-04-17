@@ -1,0 +1,97 @@
+#NORMAL ALEXNET MODEL FOR GENDER - TRAINING AND VALIDATION
+
+cuda = torch.device('cuda')
+# Data Preparation
+class CustomDataset(Dataset):
+    def __init__(self, dataframe, root_dir, transform=None):
+        self.dataframe = dataframe
+        self.root_dir = root_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.root_dir, self.dataframe.iloc[idx, 0])
+        image = Image.open(img_name).convert('RGB')  # Ensure image is RGB
+        gender = int(self.dataframe.iloc[idx, 1])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, gender
+
+
+# Define transformations for the images
+transform = transforms.Compose([
+    transforms.Resize((227, 227)),  # AlexNet's input size
+    transforms.ToTensor(),
+    transforms.CenterCrop(224),
+    transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))  # Mean and standard deviation for ImageNet
+])
+
+# Initialize custom dataset
+custom_dataset = CustomDataset(dataframe=df_gender, root_dir='train', transform=transform)
+
+# Split dataset into train and validation
+train_size = int(0.8 * len(custom_dataset))
+val_size = len(custom_dataset) - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(custom_dataset, [train_size, val_size])
+
+# DataLoader
+train_loader = DataLoader(train_dataset, batch_size=500, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=50, shuffle=False)
+
+# Model Preparation
+# Load pre-trained AlexNet
+model = torchvision.models.alexnet(pretrained=True)
+
+# Modify the output layer for binary classification (gender prediction)
+num_ftrs = model.classifier[6].in_features
+model.classifier[6] = nn.Linear(num_ftrs, 2)  # Output layer with 2 classes (male and female)
+
+# Loss function and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0001)  # Adjust learning rate
+
+val_losses = []
+train_losses = []
+val_accuracies = []
+# Training
+num_epochs = 10
+for epoch in range(num_epochs):
+    running_train_loss = 0.0
+    for images, labels in train_loader:
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_train_loss += loss.item()
+    epoch_train_loss = running_train_loss / len(train_loader)
+    train_losses.append(epoch_train_loss)
+    #print(f"Epoch {epoch+1}, Training Loss: {epoch_train_loss}")
+
+    model.eval()
+    running_val_loss = 0.0
+    correct_val = 0
+    total_val = 0
+    with torch.no_grad():
+        for data in val_loader:
+            inputs, labels = data
+            #inputs, labels = inputs.to('cuda'), labels.to('cuda')  # Move inputs and labels to CUDA device
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            running_val_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total_val += labels.size(0)
+            correct_val += (predicted == labels).sum().item()
+        epoch_val_loss = running_val_loss / len(val_loader)
+        val_losses.append(epoch_val_loss)
+        val_accuracy = 100 * correct_val / total_val
+        val_accuracies.append(val_accuracy)
+    
+    print(f"Epoch {epoch+1}, Training Loss: {epoch_train_loss}, Validation Loss: {epoch_val_loss}, Validation Accuracy: {val_accuracy}%")
+
+# Save the trained model
+torch.save(model.state_dict(), 'trained_model_gender.pth')
